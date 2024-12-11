@@ -1,0 +1,11 @@
+{
+	"id": "obsidian-incremental-tasks",
+	"name": "Incremental Tasks",
+	"version": "0.0.1",
+	"minAppVersion": "0.15.0",
+	"description": "Adds incremental tasks to obsidian.",
+	"author": "Ed Murphy",
+	"authorUrl": "https://obsidian.md",
+	"fundingUrl": "https://obsidian.md/pricing",
+	"isDesktopOnly": false
+}

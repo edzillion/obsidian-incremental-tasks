@@ -1,0 +1,497 @@
+import {
+  App,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  TFile,
+  MarkdownView,
+  Editor,
+  EditorPosition,
+  EditorRange,
+} from "obsidian";
+
+interface IncrementalTask {
+  checked: boolean;
+  title: string;
+  increment: string;
+  current: number;
+  total: number;
+  id?: string;
+  subtasks: IncrementalSubtask[];
+  range: EditorRange;
+}
+
+type PartialIncrementalTask = Partial<IncrementalTask>;
+
+interface IncrementalSubtask {
+  checked: boolean;
+  index: number;
+  range: EditorRange;
+  parent: IncrementalTask;
+  id?: string;
+}
+
+type PartialIncrementalSubtask = Partial<IncrementalSubtask>;
+
+interface IncrementalTasksSettings {
+  taskTag: string;
+  incrementalTaskTag: string;
+}
+
+// Type guard for PartialIncrementalTask
+function isIncrementalTask(obj: any): obj is PartialIncrementalTask {
+  return "checked" in obj && "title" in obj && "increment" in obj && "current" in obj && "total" in obj;
+}
+
+// Type guard for PartialIncrementalSubtask
+function isIncrementalSubtask(obj: any): obj is PartialIncrementalSubtask {
+  return "checked" in obj && "index" in obj;
+}
+
+const DEFAULT_SETTINGS: IncrementalTasksSettings = {
+  taskTag: "#task",
+  incrementalTaskTag: "#task/incr",
+};
+
+export default class IncrementalTasksPlugin extends Plugin {
+  settings: IncrementalTasksSettings;
+  tasksApi: any = (this.app as any).plugins.plugins["obsidian-tasks-plugin"].apiV1;
+  currentTasks: IncrementalTask[] | null;
+
+  async onload() {
+    await this.loadSettings();
+    // Register the processor for incremental task lines
+    this.registerMarkdownCodeBlockProcessor("incrtask", async (source, blockContainer, context) => {
+      const sectionInfo = context.getSectionInfo(blockContainer);
+      if (!sectionInfo) return;
+
+      const [title, increment, total] = source.split("\n");
+      const tasks = this.generateTasks(title, increment, parseInt(total, 10));
+
+      await this.renderTasksEditor(tasks, sectionInfo.lineStart, sectionInfo.lineEnd);
+    });
+
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (file) {
+          // does this file contain a incrtask?
+          this.getAllIncrTasks(file).then((fileTasks) => {
+            if (fileTasks) {
+              this.currentTasks = fileTasks;
+              this.registerDomEvent(this.getActiveView().contentEl, "click", (event: MouseEvent) => {
+                let task: IncrementalTask | IncrementalSubtask | undefined;
+                const partialTask = this.identifyIncrTaskClick(event);
+                if (partialTask) {
+                  const searchTask = isIncrementalTask(partialTask)
+                    ? (partialTask as PartialIncrementalTask)
+                    : (partialTask.parent as PartialIncrementalTask);
+                  task = this.currentTasks!.find((task) => {
+                    if (searchTask.id) return searchTask.id == task.id;
+                    else if (searchTask.title && searchTask.increment)
+                      return searchTask.title == task.title && searchTask.increment == task.increment;
+                  });
+                  if (!task) throw Error();
+                  this.refreshTaskFromEditor(task);
+                  if (isIncrementalSubtask(partialTask)) {
+                    task = task.subtasks[partialTask.index!];
+                  }
+                  this.handleTaskChecked(task);
+                }
+              });
+            }
+          });
+        }
+      })
+    );
+
+    // Add settings tab
+    this.addSettingTab(new IncrementalTasksSettingTab(this.app, this));
+  }
+
+  private identifyIncrTaskClick(evt: MouseEvent): PartialIncrementalTask | PartialIncrementalSubtask | undefined {
+    const target = evt.target as HTMLElement;
+
+    // Early return if not a checkbox click
+    if (!(target?.tagName === "INPUT" && target.getAttribute("type") === "checkbox")) return;
+
+    // Get the task line element from event path
+    const taskLine = (evt.composedPath() as HTMLElement[])[2];
+    if (!taskLine?.classList.contains("HyperMD-task-line")) return;
+
+    // Find the indent level
+    const indentClass = Array.from(taskLine.classList).find((cls) => cls.startsWith("HyperMD-list-line-"));
+    if (!indentClass) return;
+    const indentLevel = parseInt(indentClass.replace("HyperMD-list-line-", ""), 10);
+    let tag = taskLine.querySelector("span.cm-hashtag-end")?.textContent || "";
+    tag = "#" + tag;
+
+    // Handle root level tasks
+    if (indentLevel === 1 && tag === this.settings.incrementalTaskTag) {
+      return this.getTaskFromLine(taskLine.innerText) as PartialIncrementalTask;
+    }
+
+    // Handle nested tasks
+    if (indentLevel > 1) {
+      const parentTask = this.findParentTask(taskLine, indentLevel);
+      if (!parentTask) return;
+      let parentTaskTag = parentTask.querySelector("span.cm-hashtag-end")?.textContent;
+      parentTaskTag = "#" + parentTaskTag;
+      if (parentTaskTag === this.settings.incrementalTaskTag) {
+        const partialSubtask = this.getSubtaskFromLine(taskLine.innerText) as PartialIncrementalSubtask;
+        partialSubtask.parent = this.getTaskFromLine(parentTask.innerText) as any;
+        return partialSubtask;
+      }
+    }
+  }
+
+  // Helper function to find parent task
+  private findParentTask(element: HTMLElement, currentIndent: number): HTMLElement | null {
+    let current = element;
+    while (current.previousElementSibling) {
+      current = current.previousElementSibling as HTMLElement;
+      if (current.classList.contains(`HyperMD-list-line-${currentIndent - 1}`)) {
+        return current;
+      }
+    }
+    return null;
+  }
+
+  private generateTasks(title: string, increment: string, total: number): string[] {
+    let id = this.generateUniqueId([]);
+    let tasks = [
+      `- [ ] ${this.settings.incrementalTaskTag} ${title.trim()} 🔁 ${increment.trim()} 0/${total} ⛔ ${id}`,
+    ];
+    for (var i = 1; i < total; i++) {
+      tasks.push(`\t- [ ] ${this.settings.taskTag} ${title} - ${increment} ${i}`);
+    }
+
+    tasks[1] = tasks[1] + ` 🆔 ${id}`;
+    return tasks;
+  }
+
+  private handleTaskChecked(task: IncrementalTask | IncrementalSubtask) {
+    const newId = this.generateUniqueId([]);
+
+    if (isIncrementalTask(task)) {
+      if (task.checked) {
+        // parent task has been checked, remove ids and check all subtasks
+        this.setTaskId(task);
+        this.toggleSubtasks(task);
+      } else {
+        // parent task unchecked, set new ids and uncheck all subtasks
+        this.setTaskId(task, newId);
+        this.toggleSubtasks(task, newId);
+      }
+    } else {
+      // subtask checkbox checked
+      if (task.checked) {
+        // remove id and increment parent task
+        if (task.id) this.setTaskId(task);
+        task.parent.current++;
+        // if not all completed, set next task
+        if (task.parent.current < task.parent.total) {
+          this.resetNextTask(task.parent);
+        } else {
+          // all complete, check parent and remove ids
+          if (!task.parent.checked) this.toggleChecked(task.parent);
+          this.setTaskId(task.parent);
+        }
+      } else {
+        // subtask checkbox unchecked, uncheck parent and reset next task
+        if (task.parent.checked) this.toggleChecked(task.parent);
+        this.resetNextTask(task.parent);
+      }
+    }
+    isIncrementalTask(task) ? this.setTaskCompletion(task) : this.setTaskCompletion(task.parent);
+  }
+
+  private async getAllIncrTasks(file: TFile): Promise<IncrementalTask[] | null> {
+    const fileContent = await this.app.vault.cachedRead(file);
+    if (!fileContent.contains(this.settings.incrementalTaskTag)) return null;
+    const fileLines = fileContent.split("\n");
+
+    const incrTasks: IncrementalTask[] = [];
+
+    for (let i = 0; i < fileLines.length; i++) {
+      const line = fileLines[i];
+      if (!line.contains(this.settings.incrementalTaskTag)) continue;
+
+      const task = this.getTaskFromLine(line, i) as IncrementalTask;
+
+      for (let j = 1; j <= task.total; j++) {
+        const lineNum = i + j;
+        const l = fileLines[lineNum];
+        let subtask = this.getSubtaskFromLine(l, lineNum) as IncrementalSubtask;
+        subtask.parent = task;
+        task.subtasks.push(subtask);
+      }
+      this.setTaskCompletion(task);
+      this.resetNextTask(task);
+      incrTasks.push(task);
+    }
+    return incrTasks;
+  }
+
+  private getTaskFromLine(line: string, lineNum?: number): IncrementalTask | PartialIncrementalTask {
+    const incrTaskMatch = line.match(
+      /^[\s\u200B]*(?:- \[([xX ])\])? #task\/incr (.*?) 🔁 (\w+) (\d+)\/(\d+)( ⛔ (\w+))?/u
+    );
+
+    if (!incrTaskMatch) throw Error("bad incrTaskMatch regex");
+    const totalTasks = parseInt(incrTaskMatch[5], 10);
+    return {
+      checked: incrTaskMatch[1] ? incrTaskMatch[1].toLowerCase() == "x" : undefined,
+      title: incrTaskMatch[2],
+      increment: incrTaskMatch[3],
+      current: parseInt(incrTaskMatch[4], 10),
+      total: totalTasks,
+      id: incrTaskMatch[7] || undefined,
+      range: lineNum ? this.getTaskLineRange(line, lineNum) : undefined,
+      subtasks: [],
+    };
+  }
+
+  private getSubtaskFromLine(line: string, lineNum?: number): IncrementalSubtask | PartialIncrementalSubtask {
+    const subtaskMatch = line.match(/^[\s\u200B]*(?:- \[([xX ])\])? #task.+?\s(\d+)(?:.*?🆔 ([a-zA-Z0-9]+))?/);
+    if (!subtaskMatch) throw Error("subtaskMatch regex fail");
+    return {
+      checked: subtaskMatch[1] ? subtaskMatch[1].toLowerCase() == "x" : undefined,
+      index: parseInt(subtaskMatch[2], 10) - 1,
+      id: subtaskMatch[3] || undefined,
+      range: lineNum ? this.getTaskLineRange(line, lineNum) : undefined,
+    };
+  }
+
+  private refreshTaskFromEditor(task: IncrementalTask): IncrementalTask {
+    const refreshedTask = this.getTaskFromLine(
+      this.getEditor().getLine(task.range.from.line),
+      task.range.from.line
+    ) as IncrementalTask;
+
+    for (let i = 1; i <= refreshedTask.total; i++) {
+      const lineNum = task.range.from.line + i;
+      const l = this.getEditor().getLine(lineNum);
+      let subtask = this.getSubtaskFromLine(l, lineNum) as IncrementalSubtask;
+      subtask.parent = task;
+      refreshedTask.subtasks.push(subtask);
+    }
+
+    Object.assign(task, refreshedTask);
+    return task;
+  }
+
+  private setTaskId(task: IncrementalTask | IncrementalSubtask, newId?: string) {
+    const editor = this.getEditor();
+    const taskLine = editor.getLine(task.range.from.line);
+    // remove task id
+    const taskIdMatch = isIncrementalTask(task)
+      ? taskLine.match(/(⛔\s[a-zA-Z0-9]+\s?)/)
+      : taskLine.match(/(🆔\s[a-zA-Z0-9]+\s?)/);
+    if (taskIdMatch) {
+      const range = this.getEditorRangeFromRegexMatch(taskIdMatch, task.range.from.line, 1);
+      editor.replaceRange("", range.from, range.to);
+      console.log("remove task id", task.id);
+      task.id = undefined;
+    }
+    if (newId) {
+      // add task id
+      const insertSpaceMatch = isIncrementalTask(task) ? taskLine.match(/(\d+\/\d+)/) : taskLine.match(/.$/);
+      if (insertSpaceMatch && insertSpaceMatch.index) {
+        const insertPos = insertSpaceMatch.index + insertSpaceMatch[0].length;
+        const replacementMd = isIncrementalTask(task) ? ` ⛔ ${newId}` : ` 🆔 ${newId}`;
+        editor.replaceRange(replacementMd, {
+          ch: insertPos,
+          line: task.range.from.line,
+        });
+        console.log("add task id", newId);
+        task.id = newId;
+      }
+    }
+  }
+
+  private setTaskCompletion(task: IncrementalTask) {
+    const editor = this.getEditor();
+    const taskLine = editor.getLine(task.range.from.line);
+    const currentMatch = taskLine.match(/🔁 \w+ (\d+)/);
+    if (currentMatch && currentMatch.index) {
+      const count = task.subtasks.reduce((acc, subtask) => {
+        return subtask.checked ? acc + 1 : acc;
+      }, 0);
+      const current = parseInt(currentMatch[1], 10);
+      if (count !== current) {
+        const insertPos = currentMatch.index + currentMatch[0].indexOf(currentMatch[1]);
+        editor.replaceRange(
+          count.toString(),
+          {
+            ch: insertPos,
+            line: task.range.from.line,
+          },
+          {
+            ch: insertPos + current.toString().length,
+            line: task.range.from.line,
+          }
+        );
+        task.current = count;
+        console.log("updated completion", currentMatch[1]);
+      }
+    }
+  }
+
+  private resetNextTask(task: IncrementalTask) {
+    const firstUnchecked = task.subtasks.find((t) => !t.checked) as IncrementalSubtask;
+    const firstWithId = task.subtasks.find((t) => t.id) as IncrementalSubtask;
+    if (!firstUnchecked) return;
+
+    const newId = this.generateUniqueId([]);
+
+    if (!firstWithId) {
+      this.setTaskId(firstUnchecked, newId);
+      this.setTaskId(task, newId);
+    } else if (firstUnchecked.index < firstWithId.index) {
+      this.setTaskId(firstWithId);
+
+      this.setTaskId(firstUnchecked, newId);
+      this.setTaskId(task, newId);
+    }
+  }
+
+  private toggleSubtasks(task: IncrementalTask, newId?: string) {
+    // toggle all subtasks and remove any id
+    for (let i = 0; i < task.subtasks.length; i++) {
+      let subtask = task.subtasks[i];
+      if (subtask.checked !== task.checked) this.toggleChecked(subtask);
+      if (subtask.id) this.setTaskId(subtask);
+    }
+    // if we have unchecked then the first subtask should be given an id
+    if (!task.checked) this.setTaskId(task.subtasks[0], newId);
+  }
+
+  private toggleChecked(task: IncrementalTask | IncrementalSubtask) {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) throw Error("getActiveFile() returned nothing");
+
+    const editor = this.getEditor();
+    const taskLine = editor.getLine(task.range.from.line);
+    let newTaskLine = this.tasksApi.executeToggleTaskDoneCommand(taskLine, activeFile.path);
+    editor.replaceRange(newTaskLine, task.range.from, task.range.to);
+    task.checked = !task.checked;
+    console.log("toggling", task);
+  }
+
+  private getTaskLineRange(taskLine: string, lineNum: number): EditorRange {
+    return {
+      from: {
+        ch: 0,
+        line: lineNum,
+      },
+      to: {
+        ch: taskLine.length,
+        line: lineNum,
+      },
+    };
+  }
+
+  private getActiveView(): MarkdownView {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) throw Error("activeView is null");
+    return view;
+  }
+
+  private getEditor(): Editor {
+    const editor = this.getActiveView().editor;
+    if (!editor) throw Error("editor is null");
+    return editor;
+  }
+
+  generateUniqueId(existingIds: string[]) {
+    let id = "";
+    let keepGenerating = true;
+    const length = 6;
+
+    while (keepGenerating) {
+      // from https://www.codemzy.com/blog/random-unique-id-javascript
+      id = Math.random()
+        .toString(36)
+        .substring(2, length + 2);
+
+      if (!existingIds.includes(id)) {
+        keepGenerating = false;
+      }
+    }
+    return id;
+  }
+
+  private async renderTasksEditor(tasks: string[], startLine: number, endLine: number) {
+    const editor = this.getEditor();
+    const st: EditorPosition = { ch: 0, line: startLine };
+    const endChar = this.getEditor().getLine(endLine).length;
+    if (!endChar) return;
+    const en: EditorPosition = { ch: endChar, line: endLine };
+
+    setTimeout(() => {
+      editor.replaceRange(tasks.join("\n"), st, en);
+
+      // TODO: weird pattern here since refreshTaskFromEditor() runs next line again
+      const task = this.getTaskFromLine(editor.getLine(startLine), startLine) as IncrementalTask;
+      this.refreshTaskFromEditor(task);
+    }, 500);
+  }
+  private getEditorRangeFromRegexMatch(regexMatch: RegExpMatchArray, lineNum: number, groupIndex: number): EditorRange {
+    const index = regexMatch.index!;
+    const matchedString = regexMatch[0];
+    const capturedGroup = regexMatch[groupIndex];
+    const offset = matchedString.indexOf(capturedGroup);
+    return {
+      from: { ch: index + offset, line: lineNum },
+      to: { ch: index + offset + capturedGroup.length, line: lineNum },
+    };
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+}
+
+class IncrementalTasksSettingTab extends PluginSettingTab {
+  plugin: IncrementalTasksPlugin;
+
+  constructor(app: App, plugin: IncrementalTasksPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    new Setting(containerEl)
+      .setName("Task Tag")
+      .setDesc("Tag used for regular tasks")
+      .addText((text) =>
+        text
+          .setPlaceholder("#task")
+          .setValue(this.plugin.settings.taskTag)
+          .onChange(async (value) => {
+            this.plugin.settings.taskTag = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Incremental Task Tag")
+      .setDesc("Tag used for incremental tasks")
+      .addText((text) =>
+        text
+          .setPlaceholder("#task/incr")
+          .setValue(this.plugin.settings.incrementalTaskTag)
+          .onChange(async (value) => {
+            this.plugin.settings.incrementalTaskTag = value;
+            await this.plugin.saveSettings();
+          })
+      );
+  }
+}
